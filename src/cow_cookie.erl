@@ -318,13 +318,36 @@ parse_set_cookie_test_() ->
 cookie([]) ->
 	[];
 cookie([{<<>>, Value}]) ->
+	cookie_check_value(Value),
 	[Value];
 cookie([{Name, Value}]) ->
+	cookie_check_name(Name),
+	cookie_check_value(Value),
 	[Name, $=, Value];
 cookie([{<<>>, Value}|Tail]) ->
+	cookie_check_value(Value),
 	[Value, $;, $\s|cookie(Tail)];
 cookie([{Name, Value}|Tail]) ->
+	cookie_check_name(Name),
+	cookie_check_value(Value),
 	[Name, $=, Value, $;, $\s|cookie(Tail)].
+
+%% Reject cookie names containing characters that would allow
+%% smuggling phantom cookies (= , ;) or splitting the request
+%% header (CR LF and other control characters). This mirrors the
+%% validation already performed by parse_cookie_name/3 and setcookie/3.
+cookie_check_name(Name) ->
+	nomatch = binary:match(iolist_to_binary(Name), [<<$=>>, <<$,>>, <<$;>>,
+		<<$\t>>, <<$\r>>, <<$\n>>, <<$\013>>, <<$\014>>]),
+	ok.
+
+%% Cookie values may contain spaces (seen in the wild) so unlike
+%% setcookie/3 we do not reject them here, but we still reject the
+%% separators and control characters that enable injection.
+cookie_check_value(Value) ->
+	nomatch = binary:match(iolist_to_binary(Value), [<<$,>>, <<$;>>,
+		<<$\t>>, <<$\r>>, <<$\n>>, <<$\013>>, <<$\014>>]),
+	ok.
 
 -ifdef(TEST).
 cookie_test_() ->
@@ -337,6 +360,39 @@ cookie_test_() ->
 	],
 	[{Res, fun() -> Res = iolist_to_binary(cookie(Cookies)) end}
 		|| {Cookies, Res} <- Tests].
+
+cookie_injection_test_() ->
+	%% Names and values that attempt cookie smuggling or request
+	%% header splitting must be rejected. See CVE-2026-43969.
+	F = fun(Cookies) ->
+		try cookie(Cookies) of
+			_ -> false
+		catch _:_ ->
+			true
+		end
+	end,
+	Tests = [
+		%% Phantom cookie smuggling via separators in the value.
+		[{<<"sid">>, <<"abc; admin=1">>}],
+		[{<<"sid">>, <<"abc,evil=1">>}],
+		%% Smuggling via separators in the name.
+		[{<<"a;b">>, <<"c">>}],
+		[{<<"a,b">>, <<"c">>}],
+		[{<<"a=b">>, <<"c">>}],
+		%% Request header splitting via CRLF in name or value.
+		[{<<"sid">>, <<"x\r\nX-Injected: 1">>}],
+		[{<<"x\r\nX-Injected: 1">>, <<"v">>}],
+		[{<<>>, <<"x\r\nX-Injected: 1">>}],
+		%% Other rejected control characters.
+		[{<<"sid">>, <<"a\tb">>}],
+		[{<<"sid">>, <<"a\013b">>}],
+		[{<<"sid">>, <<"a\014b">>}],
+		%% The forbidden value also applies to non-final cookies.
+		[{<<"ok">>, <<"good">>}, {<<"sid">>, <<"x\r\nX-Injected: 1">>}]
+	],
+	[{iolist_to_binary(io_lib:format("~p rejected", [Cookies])),
+		fun() -> true = F(Cookies) end}
+		|| Cookies <- Tests].
 -endif.
 
 %% Convert a cookie name, value and options to its iodata form.

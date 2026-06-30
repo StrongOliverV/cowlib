@@ -481,10 +481,15 @@ bare_item(false) ->
 exp_div(0) -> 1;
 exp_div(N) -> 10 * exp_div(N + 1).
 
+%% A structured-fields string may only contain printable ASCII
+%% (the parser accepts %x20-7E, escaping " and \). Any other byte,
+%% including CR and LF, must be rejected here rather than emitted
+%% verbatim, otherwise it can split the header. See CVE-2026-43966.
 escape_string(<<>>, Acc) -> Acc;
 escape_string(<<$\\,R/bits>>, Acc) -> escape_string(R, <<Acc/binary,$\\,$\\>>);
 escape_string(<<$",R/bits>>, Acc) -> escape_string(R, <<Acc/binary,$\\,$">>);
-escape_string(<<C,R/bits>>, Acc) -> escape_string(R, <<Acc/binary,C>>).
+escape_string(<<C,R/bits>>, Acc) when C >= 16#20, C =< 16#7e ->
+	escape_string(R, <<Acc/binary,C>>).
 
 params(Params) ->
 	[case Param of
@@ -519,4 +524,29 @@ struct_hd_identity_test_() ->
 			<<"expected">> := Expected0
 		} <- Tests]
 	end || File <- Files]).
+
+struct_hd_string_injection_test_() ->
+	%% String values containing bytes outside the printable ASCII
+	%% range the parser accepts (most importantly CR and LF) must be
+	%% rejected by the encoder rather than emitted verbatim, which
+	%% would otherwise split the header. See CVE-2026-43966.
+	F = fun(String) ->
+		try item({item, {string, String}, []}) of
+			_ -> false
+		catch _:_ ->
+			true
+		end
+	end,
+	Tests = [
+		<<"x\r\nInjected: 1">>,
+		<<"x\rInjected: 1">>,
+		<<"x\nInjected: 1">>,
+		<<"x\ty">>,
+		<<"x", 0, "y">>,
+		<<"x", 16#7f, "y">>,
+		<<"x", 16#80, "y">>
+	],
+	[{iolist_to_binary(io_lib:format("~p rejected", [String])),
+		fun() -> true = F(String) end}
+		|| String <- Tests].
 -endif.
